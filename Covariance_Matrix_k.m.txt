@@ -1,0 +1,86 @@
+%load coordinate file to a table
+coords = readmatrix("C:\Users\madhu\OneDrive\Desktop\Textbooks\optimization\Final project\coordinates.txt");
+
+%create a matrix with only X and Y coordinates of sensors
+
+X = coords(:, 2:3);
+
+%Normalize the coordinates -- mean becomes 0 
+%--standard deviation is 1. 
+
+Xnormalized = (X - mean(X,1)) ./ std(X,[],1);
+
+%As the Yc is used as training data to calculate GP, consider full YC
+%matrix
+
+Ytrain = Yc;      % 54 × 30   (each column is one spatial temperature field sample)
+Xtrain = Xnormalized;      % 54 × 2    (normalized sensor coordinates)
+
+% Build quadratic basis for Xtrain
+H = [ones(54,1), Xtrain(:,1), Xtrain(:,2), Xtrain(:,1).^2, ...
+     Xtrain(:,1).*Xtrain(:,2), Xtrain(:,2).^2];   % 54×6
+
+% Solve for quadratic mean coefficients (beta) using all training snapshots
+beta = H \ Ytrain;;
+
+% Compute residuals (Ytrain minus quadratic mean)
+R = Ytrain - H * beta;   % size: 54 × 30
+
+%% Kernel builder: K_theta(X,X) = sigma_f^2 * exp( -1/2 [ (dx^2/ell_x^2) + (dy^2/ell_y^2) ] ) + sigma_n^2 I
+build_K = @(X, ell_x, ell_y, sigma_f, sigma_n) ...
+    (sigma_f^2) * exp( -0.5 * ( ...
+        pdist2(X(:,1), X(:,1)).^2 / ell_x^2 + ...
+        pdist2(X(:,2), X(:,2)).^2 / ell_y^2 )) ...
+    + (sigma_n^2) * eye(size(X,1));
+
+% Sum of negative log marginal likelihood across columns of R
+% Uses stable Cholesky factorization
+nll = @(theta) sum_nll(theta, Xtrain, R);
+
+function val = sum_nll(theta, X, R)
+    ell_x   = exp(theta(1));     % optimize in log-space for positivity
+    ell_y   = exp(theta(2));
+    sigma_f = exp(theta(3));
+    sigma_n = exp(theta(4));
+
+    K = (sigma_f^2) * exp( -0.5 * ( ...
+        pdist2(X(:,1), X(:,1)).^2 / ell_x^2 + ...
+        pdist2(X(:,2), X(:,2)).^2 / ell_y^2 )) ...
+        + (sigma_n^2) * eye(size(X,1));
+
+    % Cholesky
+    [L, p] = chol(K, 'lower');
+    if p > 0
+        val = Inf; return;       % not PD: penalize
+    end
+
+    % For each snapshot (column), accumulate NLL
+    % NLL(y) = 0.5*( y'K^{-1}y + logdetK + N*log(2π) )
+    N = size(X,1);
+    T = size(R,2);
+    logdetK = 2*sum(log(diag(L)));
+
+    val = 0;
+    for t = 1:T
+        y = R(:,t);
+        alpha = L' \ (L \ y);
+        val = val + 0.5*( y' * alpha + logdetK + N*log(2*pi) );
+    end
+end
+
+%% optimize the hyper parameters
+% Initial guesses (log-space)
+theta0 = log([0.5, 0.5, 1.0, 0.1]);   % [ell_x, ell_y, sigma_f, sigma_n]
+
+opts = optimset('Display','iter','TolX',1e-4,'TolFun',1e-4,'MaxIter',200);
+[theta_opt, fval] = fminsearch(@(th) nll(th), theta0, opts);
+
+% Extract optimal params
+ell_x   = exp(theta_opt(1));
+ell_y   = exp(theta_opt(2));
+sigma_f = exp(theta_opt(3));
+sigma_n = exp(theta_opt(4));
+
+% Final kernel
+K = build_K(Xtrain, ell_x, ell_y, sigma_f, sigma_n);
+
